@@ -24,6 +24,13 @@
 int preeny_desock_shutdown_flag = 0;
 pthread_t *preeny_socket_threads_to_front[PREENY_MAX_FD] = { 0 };
 pthread_t *preeny_socket_threads_to_back[PREENY_MAX_FD] = { 0 };
+int preeny_original_socket_to_front[PREENY_MAX_FD] = { 0 }; // For port filtering feature
+
+// By default (selected_port=-1), all sockets are forwarded in stdin/out
+// If a port is set, only socket associated with it will be forwarded, others use original socket functions
+int selected_port = -1; // -1 when all sockets are intercepted
+int selected_fd = -1; // For filtering,its value change when a fd socket match the selected port
+pthread_mutex_t lock; // To protected selected_fd
 
 int preeny_socket_sync(int from, int to, int timeout)
 {
@@ -48,7 +55,7 @@ int preeny_socket_sync(int from, int to, int timeout)
 	}
 
 	total_n = read(from, read_buf, READ_BUF_SIZE);
-	if (n < 0)
+	if (total_n < 0)
 	{
 		strerror_r(errno, error_buf, 1024);
 		preeny_info("synchronization of fd %d to %d shutting down due to read error '%s'\n", from, to, error_buf);
@@ -110,11 +117,45 @@ void preeny_socket_sync_loop(int from, int to)
 {
 	char error_buf[1024];
 	int r;
+	int reforwarded = 0; // To remember if fd forwarding already changed 
 
 	preeny_debug("starting forwarding from %d to %d!\n", from, to);
 
 	while (!preeny_desock_shutdown_flag)
 	{
+
+		if (selected_port !=-1 && reforwarded==0)
+		{
+			// Save previous fowarding of debug print
+			int old_from = from;
+			int old_to = to;
+			
+			int * prenny_fd = &from;
+			int * std_fd = &to; // stdin/out fd
+
+			if (*prenny_fd < 2){ // stdin= 0, stdout = 1
+				prenny_fd = &to;
+				std_fd = &from;
+			}
+
+			int unprenny_fd = *prenny_fd - PREENY_SOCKET_OFFSET;
+			int orig = preeny_original_socket_to_front[unprenny_fd]; // Get the real socket to change forwarding
+			pthread_mutex_lock(&lock); // Protect selected_fd access
+			int tmp_selected_fd = selected_fd;
+			pthread_mutex_unlock(&lock);
+
+			// If filtering is enabled (selected_port!=-1) and re forward all fd not bind on selected_port
+			if (tmp_selected_fd != -1 && unprenny_fd != tmp_selected_fd){
+				// When fd must be be interecepted
+				*std_fd = orig; // Update fowarding
+				preeny_debug("Change forwarding (before %d -> %d) now from %d to %d!\n", old_from, old_to, from, to);
+			}
+			else{
+				// unprenny_fd corresponds to fd with the port to intercept.
+				reforwarded=1;
+			}
+		}
+
 		r = preeny_socket_sync(from, to, 15);
 		if (r < 0) return;
 	}
@@ -147,6 +188,8 @@ int (*original_bind)(int, const struct sockaddr *, socklen_t);
 int (*original_listen)(int, int);
 int (*original_accept)(int, struct sockaddr *, socklen_t *);
 int (*original_connect)(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+int (*original_close)(int);
+
 __attribute__((constructor)) void preeny_desock_orig()
 {
 	original_socket = dlsym(RTLD_NEXT, "socket");
@@ -154,6 +197,14 @@ __attribute__((constructor)) void preeny_desock_orig()
 	original_accept = dlsym(RTLD_NEXT, "accept");
 	original_bind = dlsym(RTLD_NEXT, "bind");
 	original_connect = dlsym(RTLD_NEXT, "connect");
+	original_close = dlsym(RTLD_NEXT, "close");
+
+	// If PORT env var is set, only forward it
+	char *port_str = getenv("PORT");
+	int port = port_str ? atoi(port_str) : -1;
+	selected_port = port;
+
+    pthread_mutex_init(&lock, NULL);
 }
 
 int socket(int domain, int type, int protocol)
@@ -188,6 +239,14 @@ int socket(int domain, int type, int protocol)
 	preeny_socket_threads_to_front[fds[0]] = malloc(sizeof(pthread_t));
 	preeny_socket_threads_to_back[fds[0]] = malloc(sizeof(pthread_t));
 
+	if (selected_port!=-1)
+	{
+		// If a port is defined, call to original socket function and keep value in preeny_original_socket_to_front
+		int orig_fd =  original_socket(domain, type, protocol);
+		preeny_original_socket_to_front[fds[0]] = orig_fd;
+		preeny_debug("Backup original socket for port selection feature\n");
+	}
+
 	r = pthread_create(preeny_socket_threads_to_front[fds[0]], NULL, (void*(*)(void*))preeny_socket_sync_to_front, (void *)front_socket);
 	if (r)
 	{
@@ -207,8 +266,21 @@ int socket(int domain, int type, int protocol)
 
 int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 {
-	if (preeny_socket_threads_to_front[sockfd]) return dup(sockfd);
-	else return original_accept(sockfd, addr, addrlen);
+	if (preeny_socket_threads_to_front[sockfd])
+	{
+		if (selected_port != -1 && sockfd != selected_fd) // Filtering port enabled
+		{
+				int orig_fd = preeny_original_socket_to_front[sockfd];
+				return original_accept(orig_fd, addr, addrlen);
+		}
+		else
+		{
+			return dup(sockfd);
+		}
+	}
+	else{
+		return original_accept(sockfd, addr, addrlen);
+	}
 }
 
 int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags)
@@ -220,8 +292,31 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
 	if (preeny_socket_threads_to_front[sockfd])
 	{
-		preeny_info("Emulating bind on port %d\n", ntohs(((struct sockaddr_in*)addr)->sin_port));
-		return 0;
+		int port = ntohs(((struct sockaddr_in*)addr)->sin_port);
+
+		if (selected_port != -1)
+		{
+			if (selected_port != port)
+			{
+				preeny_info("Ignoring unselected socket on port %d (fd : %d)\n", port, sockfd);
+				int orig_fd = preeny_original_socket_to_front[sockfd];
+				return original_bind(orig_fd, addr, addrlen);
+			}
+			else
+			{
+				preeny_info("Filter enabled, only intercept call for sockfd=%d bind to %d port\n", sockfd, selected_port);
+				pthread_mutex_lock(&lock);
+				selected_fd = sockfd;
+				pthread_mutex_unlock(&lock);
+
+				return 0;
+			}
+		}
+		else
+		{
+			preeny_info("Emulating bind on port %d\n", port);
+			return 0;
+		}
 	}
 	else
 	{
@@ -231,12 +326,49 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 
 int listen(int sockfd, int backlog)
 {
-	if (preeny_socket_threads_to_front[sockfd]) return 0;
-	else return original_listen(sockfd, backlog);
+	if (preeny_socket_threads_to_front[sockfd])
+	{
+		if (selected_port != -1 && sockfd != selected_fd){ // Filtering port enabled
+				int orig_fd = preeny_original_socket_to_front[sockfd];
+				return original_listen(orig_fd, backlog);
+		}
+		else{
+			return 0;
+		}
+	}
+	else{
+		return original_listen(sockfd, backlog);
+	}
 }
 
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
-	if (preeny_socket_threads_to_front[sockfd]) return 0;
-	else return original_connect(sockfd, addr, addrlen);
+	if (preeny_socket_threads_to_front[sockfd])
+	{
+		if (selected_port != -1 && sockfd != selected_fd){ // Filtering enabled
+				int orig_fd = preeny_original_socket_to_front[sockfd];
+				return original_connect(orig_fd, addr, addrlen);
+		}
+		else
+		{
+			return 0;
+		}
+	}
+	else
+	{
+		return original_connect(sockfd, addr, addrlen);
+	}
+}
+
+int close(int fd)
+{
+
+	if (selected_port!=-1){
+		int orig_fd = preeny_original_socket_to_front[fd];
+		if (orig_fd > 0)
+		{
+			original_close(orig_fd);
+		}
+	}
+	return original_close(fd);
 }

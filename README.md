@@ -107,8 +107,11 @@ SKIP=2 WANT=10 MOD=128 LD_PRELOAD=x86_64-linux-gnu/desrand.so tests/rand
 
 Certain tools (such as American Fuzzy Lop, for example) are unable to handle network binaries.
 Preeny includes two "de-socketing" modules.
-`desock.so` neuters `socket()`, `bind()`, `listen()`, and `accept()`, making it return sockets that are, through hackish ways, synchronized to `stdin` and `stdout`.
+`desock.so` neuters `socket()`, `bind()`, `listen()`, `accept()`, `close`, making it return sockets that are, through hackish ways, synchronized to `stdin` and `stdout`.
 `desock_dup.so` is a simpler version for programs that dup accepted sockets over file descriptors 0, 1, and 2.
+
+It is possible to select a specific listening port with the `PORT` environment variable, to only intercept calls for this binded socket.
+Others sockets will work normaly with original socket functions.
 
 A discussion of the different ways to de-socket program, and why Preeny does it the way it does, can be found [here](https://github.com/zardus/preeny/issues/10).
 
