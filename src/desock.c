@@ -57,11 +57,16 @@ int preeny_socket_sync(int from, int to, int timeout)
 	total_n = read(from, read_buf, READ_BUF_SIZE);
 	if (total_n < 0)
 	{
-		strerror_r(errno, error_buf, 1024);
-		preeny_info("synchronization of fd %d to %d shutting down due to read error '%s'\n", from, to, error_buf);
-		return -1;
+		if (errno == ENOTCONN){ // ENOTCONN returned when TCP socket is not connected yet
+			return 0;
+		}
+		else{
+			strerror_r(errno, error_buf, 1024);
+			preeny_info("synchronization of fd %d to %d shutting down due to read error '%s' (errno=%d)\n", from, to, error_buf, errno);
+			return -1;
+		}
 	}
-	preeny_debug("read %d bytes from %d (will write to %d)\n", n, from, to);
+	preeny_debug("read %d bytes from %d (will write to %d)\n", total_n, from, to);
 
 	n = 0;
 	while (n != total_n)
@@ -70,13 +75,17 @@ int preeny_socket_sync(int from, int to, int timeout)
 		if (r < 0)
 		{
 			strerror_r(errno, error_buf, 1024);
-			preeny_info("synchronization of fd %d to %d shutting down due to read error '%s'\n", from, to, error_buf);
+			preeny_info("synchronization of fd %d to %d shutting down due to write error '%s'\n", from, to, error_buf);
 			return -1;
 		}
 		n += r;
 	}
 
-	preeny_debug("wrote %d bytes to %d (had read from %d)\n", total_n, to, from);
+	if (n>0)
+	{
+		preeny_debug("wrote %d bytes to %d (had read from %d)\n", total_n, to, from);
+	}
+
 	return total_n;
 }
 
@@ -126,33 +135,38 @@ void preeny_socket_sync_loop(int from, int to)
 
 		if (selected_port !=-1 && reforwarded==0)
 		{
-			// Save previous fowarding of debug print
+			// Save previous fowarding for debug print
 			int old_from = from;
 			int old_to = to;
 			
-			int * prenny_fd = &from;
-			int * std_fd = &to; // stdin/out fd
+			int preeny_fd = from; // We suppose that preeny fd is in from
+			int preeny_in_from = 1;
 
-			if (*prenny_fd < 2){ // stdin= 0, stdout = 1
-				prenny_fd = &to;
-				std_fd = &from;
+			if (preeny_fd < PREENY_SOCKET_OFFSET){ // If preeny fd is in to
+				preeny_fd = to;
+				preeny_in_from = 0;
 			}
 
-			int unprenny_fd = *prenny_fd - PREENY_SOCKET_OFFSET;
-			int orig = preeny_original_socket_to_front[unprenny_fd]; // Get the real socket to change forwarding
+			// Subtract the preeny offset
+			int unpreeny_fd = preeny_fd - PREENY_SOCKET_OFFSET;
+			int orig = preeny_original_socket_to_front[unpreeny_fd]; // Get the real socket to change forwarding
 			pthread_mutex_lock(&lock); // Protect selected_fd access
 			int tmp_selected_fd = selected_fd;
 			pthread_mutex_unlock(&lock);
 
-			// If filtering is enabled (selected_port!=-1) and re forward all fd not bind on selected_port
-			if (tmp_selected_fd != -1 && unprenny_fd != tmp_selected_fd){
-				// When fd must be be interecepted
-				*std_fd = orig; // Update fowarding
+			if (unpreeny_fd == tmp_selected_fd){ // This fd must be filtered, forward it to stdin/out
+				if (preeny_in_from==1){
+					to = 1;
+				}
+				else{
+					from = 0;
+
+				}
 				preeny_debug("Change forwarding (before %d -> %d) now from %d to %d!\n", old_from, old_to, from, to);
-			}
-			else{
-				// unprenny_fd corresponds to fd with the port to intercept.
 				reforwarded=1;
+			}
+			else if(tmp_selected_fd != -1){
+				reforwarded = 1;
 			}
 		}
 
@@ -168,7 +182,13 @@ void *preeny_socket_sync_to_back(void *fd)
 {
 	int front_fd = (int)fd;
 	int back_fd = PREENY_SOCKET(front_fd);
-	preeny_socket_sync_loop(back_fd, 1);
+	if (selected_port!=-1){
+		int orig = preeny_original_socket_to_front[front_fd];
+		preeny_socket_sync_loop(back_fd, orig);
+	}
+	else{
+		preeny_socket_sync_loop(back_fd, 1);
+	}
 	return NULL;
 }
 
@@ -176,7 +196,13 @@ void *preeny_socket_sync_to_front(void *fd)
 {
 	int front_fd = (int)fd;
 	int back_fd = PREENY_SOCKET(front_fd);
-	preeny_socket_sync_loop(0, back_fd);
+	if (selected_port!=-1){
+		int orig = preeny_original_socket_to_front[front_fd];
+		preeny_socket_sync_loop(orig, back_fd);
+	}
+	else{
+		preeny_socket_sync_loop(0, back_fd);
+	}
 	return NULL;
 }
 
@@ -204,7 +230,7 @@ __attribute__((constructor)) void preeny_desock_orig()
 	int port = port_str ? atoi(port_str) : -1;
 	selected_port = port;
 
-    pthread_mutex_init(&lock, NULL);
+	pthread_mutex_init(&lock, NULL);
 }
 
 int socket(int domain, int type, int protocol)
@@ -232,7 +258,7 @@ int socket(int domain, int type, int protocol)
 
 	front_socket = fds[0];
 	back_socket = dup2(fds[1], PREENY_SOCKET(front_socket));
-	close(fds[1]);
+	original_close(fds[1]);
 
 	preeny_debug("... dup into socketpair (%d, %d)\n", fds[0], back_socket);
 
@@ -285,7 +311,7 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 
 int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags)
 {
-       accept(sockfd, addr, addrlen);
+	accept(sockfd, addr, addrlen);
 }
 
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
@@ -326,7 +352,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 
 int listen(int sockfd, int backlog)
 {
-	if (preeny_socket_threads_to_front[sockfd])
+		if (preeny_socket_threads_to_front[sockfd])
 	{
 		if (selected_port != -1 && sockfd != selected_fd){ // Filtering port enabled
 				int orig_fd = preeny_original_socket_to_front[sockfd];
@@ -362,8 +388,7 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 
 int close(int fd)
 {
-
-	if (selected_port!=-1){
+	if (selected_port!=-1&& fd < PREENY_MAX_FD){
 		int orig_fd = preeny_original_socket_to_front[fd];
 		if (orig_fd > 0)
 		{
